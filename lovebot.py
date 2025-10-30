@@ -1,130 +1,158 @@
-# app.py
-from flask import Flask
-import threading
-import time
-import requests
-import random
-from datetime import datetime
-import pytz
-import os
+# lovebot.py
+import logging, os, json, pytz, datetime, asyncio, requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    CallbackQueryHandler, MessageHandler, filters
+)
 
-app = Flask(__name__)
+# -------------------- ENV --------------------
+BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
+PARTNER_CHAT_ID  = int(os.getenv("PARTNER_CHAT_ID", "0"))  # پارتنرت
+YOUR_CHAT_ID     = int(os.getenv("YOUR_CHAT_ID", "0"))     # خودت
+HF_TOKEN         = os.getenv("HF_TOKEN", "")               # اختیاری برای AI
+SEND_HOUR_IRAN   = int(os.getenv("SEND_HOUR_IRAN", "10"))  # ساعت ارسال 10 صبح ایران
+CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "30"))  # هر 30 ثانیه چک
 
-# -------- تنظیمات (از Env می‌خونه) --------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")            # مقدار رو در Render قرار بده
-CHAT_ID = int(os.environ.get("CHAT_ID", "0"))     # مقدار عددی (int)
-HF_API_KEY = os.environ.get("HF_API_KEY")         # HuggingFace token
-SEND_HOUR_IRAN = int(os.environ.get("SEND_HOUR_IRAN", "10"))  # ساعت ارسال به وقت ایران
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60")) # بررسی هر چند ثانیه برای ارسال (داخل loop)
-
-# -------- تنظیمات HF Inference --------
-HF_API_URL = "https://api-inference.huggingface.co/models/gpt2"  # یا مدل دیگه که خواستی
-HF_HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-
-# -------- timezone ایران --------
 IRAN_TZ = pytz.timezone("Asia/Tehran")
+DB_FILE = "period_status.json"
 
-# -------- توابع --------
-def generate_love_message():
-    """یک متن کوتاه عاشقانه تولید می‌کند (fallback ساده هم دارد)."""
-    prompts = [
-        "یه پیام کوتاه و خودمونی عاشقانه به فارسی بنویس، صمیمی و ناز:",
-        "جمله‌ای خیلی لطیف و عاشقانه برای دوست دخترم به فارسی بنویس:",
-        "متن کوتاه و خاص و عاشقانه، خودمونی و رومانتیک:"
-    ]
-    prompt = random.choice(prompts)
-    payload = {"inputs": prompt, "options": {"wait_for_model": True}}
-    try:
-        r = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        # فرمت پاسخ ممکنه بین مدل‌ها فرق کنه؛
-        # اگر پاسخ array از نوع {"generated_text": "..."} باشه:
-        if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
-            text = data[0]["generated_text"]
-        # برخی inference ها متن را مستقیم در یک فیلد دیگر دارند — ساده fallback:
-        elif isinstance(data, dict) and "generated_text" in data:
-            text = data["generated_text"]
-        else:
-            # تلاش برای استخراج متن از رشته‌ی JSON یا موارد دیگر
-            text = str(data)
-        text = text.strip().replace("\n", " ")
-        # محدودیت طول پیام
-        return (text[:450] + "...") if len(text) > 450 else text
-    except Exception as e:
-        print("⚠️ HF generate error:", e, flush=True)
-        # fallback پیام آماده
-        fallback = [
-            "عشق منی؛ همیشه یادتم 💖",
-            "صبحت بخیر عشقم، دلم برات تنگه 😘",
-            "قربونت برم، امروز هم بهترینِ منی 💫"
-        ]
-        return random.choice(fallback)
+logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
 
-def send_message(text):
-    """ارسال پیام به تلگرام"""
-    if not BOT_TOKEN or CHAT_ID == 0:
-        print("❌ BOT_TOKEN یا CHAT_ID تنظیم نشده", flush=True)
-        return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, data=payload, timeout=15)
-        r.raise_for_status()
-        print("✅ Message sent successfully.", flush=True)
-        return True
-    except Exception as e:
-        print("❌ Telegram send error:", e, flush=True)
-        return False
-
-def is_time_to_send():
-    """بررسی می‌کند الان وقت ارسال پیام به وقت ایران هست یا نه."""
-    now = datetime.now(IRAN_TZ)
-    # ارسال دقیق در دقیقه صفر ساعت مشخص
-    return now.hour == SEND_HOUR_IRAN and now.minute == 0
-
-def daily_loop():
-    """لوپ پس‌زمینه که هر روز ساعت مشخص پیام می‌فرستد."""
-    print("🔄 Daily loop started", flush=True)
-    sent_today = False
-    while True:
+# -------------------- DB --------------------
+def load_status():
+    if os.path.exists(DB_FILE):
         try:
-            if is_time_to_send():
-                if not sent_today:
-                    msg = generate_love_message()
-                    send_message(msg)
-                    sent_today = True
-                else:
-                    # قبلاً امروز فرستاده شده، منتظر بمان تا ساعت از محدوده خارج شود
-                    pass
-            else:
-                # وقتی ساعت رفت به غیر از زمان ارسال، flag رو ریست کن
-                if sent_today:
-                    sent_today = False
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_status(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# -------------------- پیام‌های پریودی --------------------
+PERIOD_MESSAGES = [
+    "قلبم 🩷 امروز هیچی ازت نمی‌خوام جز اینکه یه کوچولو بیشتر استراحت کنی. بدن نازت خسته‌ست، تاج سرمی تو، بذار یه کم نفس بکشی 😚",
+    "دردت به جونم نفسم 😢 امروز اگه حالت گرفته‌ست، بدون من کنارت نفس می‌کشم. یه چای گرم بخور و بخند برام، ماه منی تو ❤️",
+    "سقت بام عشقم 😘 امروز فقط می‌خوام بدونی قشنگ‌ترین آدم دنیایی، حتی وقتی رنگت پریده‌ست. فدات شم که اینقدر قوی‌ای 💪",
+    "نفسم 💕 زیاد فکر نکن، یه آهنگ آروم گوش بده، پتوتو بپیچ دورت و بدون من همین الان دارم بهت فکر می‌کنم 😍",
+    "فدات شم تاج سرم 👑 اگه دل‌درد داری، آروم بخواب، من همین‌جا کنارتم، کاش بودم بغل‌ت کنم 💞",
+    "ماه من 🌙 روز شیشمه، یعنی دیگه تمومه قربون اون صبرت برم 😍 یه لبخند بزن که دلم قنج بره 😘",
+    "امیدم 😍 آخ که نفس بکشم وقتی بدونم حالت خوب شده ❤️ تموم شد عشق من، از فردا فقط لبخند و خوشحالی باشه برام 😍"
+]
+
+# -------------------- UI --------------------
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🩸 من پریود شدم", callback_data="period")],
+        [InlineKeyboardButton("🤖 حرف زدن با هوش مصنوعی", callback_data="ai_chat")],
+        [InlineKeyboardButton("💌 دلتنگتم", callback_data="miss_you")]
+    ])
+
+# -------------------- Handlers --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "سلام نازنینم 🌸 من همیشه اینجام برای تو 💖\nیکی از گزینه‌ها رو بزن:",
+        reply_markup=main_menu()
+    )
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("منو:", reply_markup=main_menu())
+
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    status = load_status()
+
+    if data == "period":
+        today = datetime.datetime.now(IRAN_TZ).date().isoformat()
+        status["period_start"] = today
+        save_status(status)
+        await query.message.reply_text(
+            "مرسی که گفتی عزیز دلم 🩷 از امروز تا ۷ روز مراقبتت می‌کنم 😘",
+            reply_markup=main_menu()
+        )
+
+    elif data == "ai_chat":
+        status["ai_mode"] = True
+        save_status(status)
+        await query.message.reply_text("هرچی خواستی بپرس عشق من 😍 (برای خروج از حالت AI، /menu بزن)")
+
+    elif data == "miss_you":
+        text = "زهرا دلش برات تنگ شده 😍 زنگش بزن یا براش یه پیام بفرست 💞"
+        try:
+            requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                params={"chat_id": YOUR_CHAT_ID, "text": text}, timeout=10
+            )
         except Exception as e:
-            print("⚠️ Error in daily loop:", e, flush=True)
-        time.sleep(CHECK_INTERVAL)
+            logging.info(f"Send to YOU failed: {e}")
+        await query.message.reply_text("بهش گفتم که دلت تنگ شده 🥺❤️", reply_markup=main_menu())
 
-# -------- Flask routes برای تست --------
-@app.route("/")
-def home():
-    return "<h3>✅ Love-bot alive</h3>", 200
+async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = load_status()
+    if not status.get("ai_mode"):
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    if not HF_TOKEN:
+        await update.message.reply_text("فعلاً هوش مصنوعی غیرفعاله 😅 /menu رو بزن برگردی به منو")
+        return
+    try:
+        resp = requests.post(
+            "https://api-inference.huggingface.co/models/gpt2",
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            json={"inputs": text, "options": {"wait_for_model": True}},
+            timeout=30
+        )
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
+            msg = data[0]["generated_text"]
+        else:
+            msg = str(data)
+        await update.message.reply_text(msg[:700])
+    except Exception:
+        await update.message.reply_text("اوه مشکل پیش اومد، یه کم دیگه امتحان کن عشق من 🫶")
 
-@app.route("/test_send")
-def test_send_route():
-    """با باز کردن این آدرس یک پیام تست برای CHAT_ID ارسال می‌شود."""
-    text = generate_love_message()
-    ok = send_message(text)
-    return ("✅ Test message sent" if ok else "❌ Test failed; check logs"), 200
+# -------------------- Daily loop --------------------
+async def daily_check(app):
+    while True:
+        now = datetime.datetime.now(IRAN_TZ)
+        if now.hour == SEND_HOUR_IRAN and now.minute < 1:
+            status = load_status()
+            if "period_start" in status:
+                start_date = datetime.date.fromisoformat(status["period_start"])
+                delta = (now.date() - start_date).days
+                if 0 <= delta < 7:
+                    msg = PERIOD_MESSAGES[delta]
+                    try:
+                        await app.bot.send_message(chat_id=PARTNER_CHAT_ID, text=msg)
+                    except Exception as e:
+                        logging.info(f"Send period msg failed: {e}")
+                elif delta >= 7:
+                    del status["period_start"]
+                    save_status(status)
+        await asyncio.sleep(CHECK_INTERVAL)
 
-@app.route("/keep_alive")
-def keep_alive():
-    return "✅ Bot is alive!", 200
+# -------------------- Boot --------------------
+async def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN ست نشده!")
+        return
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CallbackQueryHandler(button_click))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message))
+    asyncio.create_task(daily_check(app))
+    print("💖 LoveBot is running…")
+    await app.run_polling()
 
-# -------- شروع ترد و اجرای Flask --------
 if __name__ == "__main__":
-    # ترد ارسال روزانه را راه‌اندازی کن
-    t = threading.Thread(target=daily_loop, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())
