@@ -1,158 +1,114 @@
-# lovebot.py
-import logging, os, json, pytz, datetime, asyncio, requests
+import os
+import asyncio
+import random
+import datetime
+import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes,
-    CallbackQueryHandler, MessageHandler, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+import requests
 
-# -------------------- ENV --------------------
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
-PARTNER_CHAT_ID  = int(os.getenv("PARTNER_CHAT_ID", "0"))  # پارتنرت
-YOUR_CHAT_ID     = int(os.getenv("YOUR_CHAT_ID", "0"))     # خودت
-HF_TOKEN         = os.getenv("HF_TOKEN", "")               # اختیاری برای AI
-SEND_HOUR_IRAN   = int(os.getenv("SEND_HOUR_IRAN", "10"))  # ساعت ارسال 10 صبح ایران
-CHECK_INTERVAL   = int(os.getenv("CHECK_INTERVAL", "30"))  # هر 30 ثانیه چک
+# گرفتن توکن‌ها از متغیرهای محیطی
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PARTNER_CHAT_ID = int(os.getenv("PARTNER_CHAT_ID"))
+YOUR_CHAT_ID = int(os.getenv("YOUR_CHAT_ID"))
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-IRAN_TZ = pytz.timezone("Asia/Tehran")
-DB_FILE = "period_status.json"
+# ساعت ارسال روزانه به وقت ایران
+SEND_HOUR_IRAN = int(os.getenv("SEND_HOUR_IRAN", 10))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 30))
 
-logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
+# دیتای موقت برای حالت پریود
+period_start = None
 
-# -------------------- DB --------------------
-def load_status():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_status(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-# -------------------- پیام‌های پریودی --------------------
-PERIOD_MESSAGES = [
-    "قلبم 🩷 امروز هیچی ازت نمی‌خوام جز اینکه یه کوچولو بیشتر استراحت کنی. بدن نازت خسته‌ست، تاج سرمی تو، بذار یه کم نفس بکشی 😚",
-    "دردت به جونم نفسم 😢 امروز اگه حالت گرفته‌ست، بدون من کنارت نفس می‌کشم. یه چای گرم بخور و بخند برام، ماه منی تو ❤️",
-    "سقت بام عشقم 😘 امروز فقط می‌خوام بدونی قشنگ‌ترین آدم دنیایی، حتی وقتی رنگت پریده‌ست. فدات شم که اینقدر قوی‌ای 💪",
-    "نفسم 💕 زیاد فکر نکن، یه آهنگ آروم گوش بده، پتوتو بپیچ دورت و بدون من همین الان دارم بهت فکر می‌کنم 😍",
-    "فدات شم تاج سرم 👑 اگه دل‌درد داری، آروم بخواب، من همین‌جا کنارتم، کاش بودم بغل‌ت کنم 💞",
-    "ماه من 🌙 روز شیشمه، یعنی دیگه تمومه قربون اون صبرت برم 😍 یه لبخند بزن که دلم قنج بره 😘",
-    "امیدم 😍 آخ که نفس بکشم وقتی بدونم حالت خوب شده ❤️ تموم شد عشق من، از فردا فقط لبخند و خوشحالی باشه برام 😍"
+# پیام‌های عاشقانه برای حالت پریود
+period_messages = [
+    "عشق من ❤️ بدونی که این روزا فقط آروم باش... من همیشه کنارتم تاج سرم 🥺💋",
+    "قلبم 😘 دردت به جونم، سعی کن استراحت کنی و زیاد خودتو اذیت نکنی 🩷",
+    "نفسم، یه لیوان چای بخور و فیلمی که دوست داری رو ببین 🎬 من هواتو دارم ❤️",
+    "سقت بام عزیز دلم 😍 این چند روزم مثل همیشه باهم ردش می‌کنیم 💪"
 ]
 
-# -------------------- UI --------------------
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🩸 من پریود شدم", callback_data="period")],
-        [InlineKeyboardButton("🤖 حرف زدن با هوش مصنوعی", callback_data="ai_chat")],
-        [InlineKeyboardButton("💌 دلتنگتم", callback_data="miss_you")]
-    ])
+# پیام‌های صبح عاشقانه
+love_messages = [
+    "صبح بخیر عشقم 😘 امروز هم مثل همیشه دلم فقط با یاد تو آروم میشه 💞",
+    "قلبم 💖 امیدوارم روزت پر از حس خوب و آرامش باشه 🌸",
+    "نفسم 😍 فقط خواستم یادت بندازم چقدر برام خاصی 😚",
+    "دردت به جونم 💋 همیشه بخند چون دلم می‌خواد لبخندتو ببینه 🌞",
+    "فدات شم تاج سرم 💞 بدون تو این دنیا هیچ معنی‌ای نداره 😍"
+]
 
-# -------------------- Handlers --------------------
+# ساخت کیبورد منو اصلی
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("🩸 پریود شدم", callback_data="period")],
+        [InlineKeyboardButton("🤖 حرف زدن با هوش مصنوعی", callback_data="ai")],
+        [InlineKeyboardButton("💌 دلتنگتم", callback_data="missing")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# دستور /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام نازنینم 🌸 من همیشه اینجام برای تو 💖\nیکی از گزینه‌ها رو بزن:",
+        "سلام عشق من 💖\nمن اینجام تا هر روز حالت رو بهتر کنم 😍\nیه گزینه رو انتخاب کن:",
         reply_markup=main_menu()
     )
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("منو:", reply_markup=main_menu())
-
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# هندلر دکمه‌ها
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global period_start
     query = update.callback_query
     await query.answer()
-    data = query.data
 
-    status = load_status()
-
-    if data == "period":
-        today = datetime.datetime.now(IRAN_TZ).date().isoformat()
-        status["period_start"] = today
-        save_status(status)
-        await query.message.reply_text(
-            "مرسی که گفتی عزیز دلم 🩷 از امروز تا ۷ روز مراقبتت می‌کنم 😘",
-            reply_markup=main_menu()
+    if query.data == "period":
+        period_start = datetime.datetime.now(pytz.timezone("Asia/Tehran"))
+        await query.edit_message_text("❤️ فهمیدم عشقم، از امروز تا ۷ روز مراقبتت می‌کنم 😘")
+    elif query.data == "ai":
+        await query.edit_message_text("بنویس عشقم 🌸 چی می‌خوای ازم بپرسی؟ (فعلاً بخش هوش مصنوعی آزمایشی‌ه)")
+    elif query.data == "missing":
+        await context.bot.send_message(
+            chat_id=YOUR_CHAT_ID,
+            text="💌 زهرا دلش برات تنگ شده 😢 وقتشه بهش پیام بدی یا زنگ بزنی ❤️"
         )
+        await query.edit_message_text("فدات شم 😍 بهش گفتم که دلت تنگ شده 💞")
 
-    elif data == "ai_chat":
-        status["ai_mode"] = True
-        save_status(status)
-        await query.message.reply_text("هرچی خواستی بپرس عشق من 😍 (برای خروج از حالت AI، /menu بزن)")
-
-    elif data == "miss_you":
-        text = "زهرا دلش برات تنگ شده 😍 زنگش بزن یا براش یه پیام بفرست 💞"
-        try:
-            requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                params={"chat_id": YOUR_CHAT_ID, "text": text}, timeout=10
-            )
-        except Exception as e:
-            logging.info(f"Send to YOU failed: {e}")
-        await query.message.reply_text("بهش گفتم که دلت تنگ شده 🥺❤️", reply_markup=main_menu())
-
-async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = load_status()
-    if not status.get("ai_mode"):
+# تابع ارسال پیام پریود
+async def send_period_message(app):
+    global period_start
+    if not period_start:
         return
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    if not HF_TOKEN:
-        await update.message.reply_text("فعلاً هوش مصنوعی غیرفعاله 😅 /menu رو بزن برگردی به منو")
-        return
-    try:
-        resp = requests.post(
-            "https://api-inference.huggingface.co/models/gpt2",
-            headers={"Authorization": f"Bearer {HF_TOKEN}"},
-            json={"inputs": text, "options": {"wait_for_model": True}},
-            timeout=30
-        )
-        data = resp.json()
-        if isinstance(data, list) and len(data) > 0 and "generated_text" in data[0]:
-            msg = data[0]["generated_text"]
-        else:
-            msg = str(data)
-        await update.message.reply_text(msg[:700])
-    except Exception:
-        await update.message.reply_text("اوه مشکل پیش اومد، یه کم دیگه امتحان کن عشق من 🫶")
+    now = datetime.datetime.now(pytz.timezone("Asia/Tehran"))
+    if (now - period_start).days < 7:
+        msg = random.choice(period_messages)
+        await app.bot.send_message(chat_id=PARTNER_CHAT_ID, text=msg)
+    else:
+        period_start = None
 
-# -------------------- Daily loop --------------------
-async def daily_check(app):
+# ارسال پیام صبح
+async def send_daily_love(app):
+    iran = pytz.timezone("Asia/Tehran")
+    now = datetime.datetime.now(iran)
+    if now.hour == SEND_HOUR_IRAN:
+        msg = random.choice(love_messages)
+        await app.bot.send_message(chat_id=PARTNER_CHAT_ID, text=msg)
+
+# حلقه بررسی و ارسال خودکار
+async def scheduler(app):
     while True:
-        now = datetime.datetime.now(IRAN_TZ)
-        if now.hour == SEND_HOUR_IRAN and now.minute < 1:
-            status = load_status()
-            if "period_start" in status:
-                start_date = datetime.date.fromisoformat(status["period_start"])
-                delta = (now.date() - start_date).days
-                if 0 <= delta < 7:
-                    msg = PERIOD_MESSAGES[delta]
-                    try:
-                        await app.bot.send_message(chat_id=PARTNER_CHAT_ID, text=msg)
-                    except Exception as e:
-                        logging.info(f"Send period msg failed: {e}")
-                elif delta >= 7:
-                    del status["period_start"]
-                    save_status(status)
-        await asyncio.sleep(CHECK_INTERVAL)
+        await send_period_message(app)
+        await send_daily_love(app)
+        await asyncio.sleep(CHECK_INTERVAL * 60)
 
-# -------------------- Boot --------------------
+# اجرای اصلی
 async def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN ست نشده!")
-        return
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CallbackQueryHandler(button_click))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_message))
-    asyncio.create_task(daily_check(app))
+    app.add_handler(CallbackQueryHandler(button_handler))
     print("💖 LoveBot is running…")
+    asyncio.create_task(scheduler(app))
     await app.run_polling()
 
+# 👇 اصلاح شده برای Render و Python 3.13 👇
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
